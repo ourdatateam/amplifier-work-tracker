@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -38,12 +39,15 @@ class HostedDeploymentSafetyTests(unittest.TestCase):
 
     def test_install_is_pinned_and_uses_service_user_context(self):
         script = self.read("install-host.sh")
+        project = tomllib.loads((DEPLOY.parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+        hosted_dependencies = project["project"]["optional-dependencies"]["hosted"]
         self.assertLess(script.index("hostname -s"), script.index("apt-get update"))
         self.assertIn("sha256sum -c SHA256SUMS", script)
         self.assertIn("exactly the three reviewed artifact pins", script)
         self.assertIn("--no-same-owner", script)
-        self.assertIn("mcp==1.30.0", script)
-        self.assertIn("amplifier-core==2.0.2", script)
+        self.assertIn("mcp==1.30.0", hosted_dependencies)
+        self.assertIn("amplifier-core==2.0.2", hosted_dependencies)
+        self.assertIn("[web,hosted]", script)
         self.assertNotIn("BEADS_DB", script)
         self.assertNotRegex(script, re.compile(r"^export HOME=", re.M))
         self.assertNotRegex(script, re.compile(r"After=.*amplifier-work-tracker\.service"))
