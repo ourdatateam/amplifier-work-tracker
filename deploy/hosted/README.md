@@ -104,11 +104,13 @@ After a successful archive and service restart, it keeps the seven newest
 checksum-verified archives and their sidecars. Pruning matches only timestamped
 `beads-*.tar.gz` archives and their exact sidecars in `/var/backups/beads`.
 Archive and sidecar remain root:root mode 0600 there.
-Restore has not been tested: restore into an isolated replacement CT, never
-over a live installation.
+Restore into an isolated replacement CT or private Dolt data directory, then
+verify expected issue content before cutover. Keep runtime acceptance and
+recovery helpers with the backups under `/opt/beads/acceptance`; a checksum
+alone does not establish logical recovery. Never restore over a live installation.
 
 If the initial install left the UI pointed at the old directory, copy the
-reviewed `/root/workspaces/beads-phase1/runtime-repair/repair-installed.sh`
+reviewed `deploy/hosted/repair-installed.sh`
 into the new container and run it as root. It is guarded to hostname `beads160`,
 checks both existing project directories and the active upstream user service,
 repairs the UI working directory and watcher path, refreshes backup/verification
