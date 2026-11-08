@@ -57,6 +57,11 @@ web = [
     "cryptography>=42.0",  # TLS cert generation -- webtls.py's `setup-tls` command
     "httpx>=0.27",  # starlette.testclient.TestClient's transport (web tests) AND webpush.py's ntfy alarm delivery (service concern, runtime dep)
 ]
+# Hosted MCP transport dependencies. `web` already provides uvicorn.
+hosted = [
+    "mcp==1.30.0",
+    "amplifier-core==2.0.2",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/amplifier_work_tracker"]
