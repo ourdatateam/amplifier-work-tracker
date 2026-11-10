@@ -25,6 +25,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -276,7 +277,7 @@ def test_project_summary_keeps_readiness_unknown_for_malformed_dependency_payloa
     )
     ws = SimpleNamespace(creation_state=lambda _name: "ready")
 
-    summary = A.project_summary(ws, "proj")
+    summary = A.project_summary(cast(A.Workspace, ws), "proj")
 
     assert summary.status == A.STATUS_OK
     assert summary.total == 1
@@ -306,7 +307,7 @@ def test_project_summary_accepts_a_valid_control_only_dependency_result(monkeypa
     )
     ws = SimpleNamespace(creation_state=lambda _name: "ready")
 
-    summary = A.project_summary(ws, "proj")
+    summary = A.project_summary(cast(A.Workspace, ws), "proj")
 
     assert summary.ready == 1
     assert summary.ready_age_buckets is not None
