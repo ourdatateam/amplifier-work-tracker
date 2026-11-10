@@ -56,6 +56,9 @@ def test_status_breakdown_matches_manual_count(
     _set_status(bd, blocked_id, "blocked")
     _set_status(bd, deferred_id, "deferred")
     bd.resolve(resolved_id, "status test cleanup", actor=unique_actor)
+    # Seed a closed blocker so the dependency summary returns a complete row
+    # and confirms that resolved blockers leave the open work item ready.
+    bd.add_dependency(open_id, resolved_id, dep_type="blocks", actor=unique_actor)
 
     # Manual ground truth, from the same live project, computed independently
     # of anything cmd_status/cmd_instances do internally.

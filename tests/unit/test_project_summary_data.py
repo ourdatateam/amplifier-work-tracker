@@ -19,10 +19,15 @@ These pin the four data-layer invariants the dashboard depends on:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import cast
+
+import pytest
 
 from amplifier_work_tracker import adapter as A
 
@@ -94,6 +99,220 @@ def test_ready_age_buckets_counts_only_open_work_lane_items():
     ]
     buckets = A._ready_age_buckets(items)  # noqa: SLF001
     assert sum(buckets.values()) == 1
+
+
+def test_ready_derivations_share_only_items_without_active_blockers():
+    available = _ready("available", 2.0)
+    dependent = _ready("dependent", 30.0)
+    blocked_ids = {"dependent"}
+    ready = [i for i in [available, dependent] if i.id not in blocked_ids]
+
+    activity = A.project_activity([available, dependent], ready_items=ready)
+    buckets = A._ready_age_buckets([available, dependent], ready_items=ready)  # noqa: SLF001
+
+    assert len(ready) == 1
+    assert sum(buckets.values()) == len(ready)
+    assert activity["oldest_unclaimed_age_seconds"] is not None
+    assert activity["oldest_unclaimed_age_seconds"] < 3 * 86400
+
+
+def test_active_blocked_id_aggregate_reuses_claim_predicate_and_keeps_unknown_active(monkeypatch):
+    rows = [
+        {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+        *[
+            {
+                "row_kind": "dependency",
+                "item_id": "open",
+                "dependency_type": "blocks",
+                "status": "open",
+            },
+            {
+                "row_kind": "dependency",
+                "item_id": "held",
+                "dependency_type": "blocks",
+                "status": "in_progress",
+            },
+            {
+                "row_kind": "dependency",
+                "item_id": "blocked",
+                "dependency_type": "blocks",
+                "status": "blocked",
+            },
+            {
+                "row_kind": "dependency",
+                "item_id": "deferred",
+                "dependency_type": "blocks",
+                "status": "deferred",
+            },
+            {
+                "row_kind": "dependency",
+                "item_id": "unknown",
+                "dependency_type": "blocks",
+                "status": None,
+            },
+            {
+                "row_kind": "dependency",
+                "item_id": "resolved",
+                "dependency_type": "blocks",
+                "status": "closed",
+            },
+            {
+                "row_kind": "dependency",
+                "item_id": "related",
+                "dependency_type": "related",
+                "status": "open",
+            },
+            {
+                "row_kind": "dependency",
+                "item_id": "discovered",
+                "dependency_type": "discovered-from",
+                "status": "open",
+            },
+        ],
+    ]
+    monkeypatch.setattr(
+        A,
+        "_dolt_sql_json",
+        lambda query: SimpleNamespace(returncode=0, stdout=json.dumps({"rows": rows})),
+    )
+
+    assert A._active_blocked_item_ids_via_sql("proj") == {  # noqa: SLF001
+        "open",
+        "held",
+        "blocked",
+        "deferred",
+        "unknown",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"rows": None},
+        {"rows": {}},
+        [],
+        None,
+        {"rows": []},
+        {
+            "rows": [
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+            ]
+        },
+        {
+            "rows": [
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+                None,
+            ]
+        },
+        {
+            "rows": [
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+                {"row_kind": "dependency", "dependency_type": "blocks", "status": "open"},
+            ]
+        },
+        {
+            "rows": [
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+                {
+                    "row_kind": "dependency",
+                    "item_id": None,
+                    "dependency_type": "blocks",
+                    "status": "open",
+                },
+            ]
+        },
+        {
+            "rows": [
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+                {"row_kind": "dependency", "item_id": "x", "status": "open"},
+            ]
+        },
+        {
+            "rows": [
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+                {
+                    "row_kind": "dependency",
+                    "item_id": "x",
+                    "dependency_type": None,
+                    "status": "open",
+                },
+            ]
+        },
+        {
+            "rows": [
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+                {"row_kind": "dependency", "item_id": "x", "dependency_type": "blocks"},
+            ]
+        },
+        {
+            "rows": [
+                {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""},
+                {
+                    "row_kind": "dependency",
+                    "item_id": "x",
+                    "dependency_type": "blocks",
+                    "status": 1,
+                },
+            ]
+        },
+        {"rows": [{"row_kind": "control", "item_id": "bad", "dependency_type": "", "status": ""}]},
+        "not json",
+    ],
+)
+def test_project_summary_keeps_readiness_unknown_for_malformed_dependency_payloads(
+    payload, monkeypatch
+):
+    item = _ready("dependent", 30.0)
+    monkeypatch.setattr(A, "_summary_items_via_sql", lambda _db: [item])
+    monkeypatch.setattr(
+        A,
+        "_dolt_sql_json",
+        lambda _query: SimpleNamespace(
+            returncode=0,
+            stdout=payload if isinstance(payload, str) else json.dumps(payload),
+            stderr="",
+        ),
+    )
+    ws = SimpleNamespace(creation_state=lambda _name: "ready")
+
+    summary = A.project_summary(cast(A.Workspace, ws), "proj")
+
+    assert summary.status == A.STATUS_OK
+    assert summary.total == 1
+    assert summary.intake == 0
+    assert summary.ready is None
+    assert summary.ready_age_buckets is None
+    assert summary.oldest_unclaimed_age_seconds is None
+
+
+def test_project_summary_accepts_a_valid_control_only_dependency_result(monkeypatch):
+    item = _ready("unblocked", 2.0)
+    monkeypatch.setattr(A, "_summary_items_via_sql", lambda _db: [item])
+    monkeypatch.setattr(
+        A,
+        "_dolt_sql_json",
+        lambda _query: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "rows": [
+                        {"row_kind": "control", "item_id": "", "dependency_type": "", "status": ""}
+                    ]
+                }
+            ),
+            stderr="",
+        ),
+    )
+    ws = SimpleNamespace(creation_state=lambda _name: "ready")
+
+    summary = A.project_summary(cast(A.Workspace, ws), "proj")
+
+    assert summary.ready == 1
+    assert summary.ready_age_buckets is not None
+    assert sum(summary.ready_age_buckets.values()) == 1
+    assert summary.oldest_unclaimed_age_seconds is not None
 
 
 # ------------------------------------------------------ resolved throughput

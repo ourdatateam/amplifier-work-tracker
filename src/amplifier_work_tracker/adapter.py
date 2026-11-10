@@ -2459,6 +2459,78 @@ def _forward_active_blockers_via_sql(db: str, item_id: str) -> list[dict]:
     ]
 
 
+def _active_blocked_item_ids_via_sql(db: str) -> set[str]:
+    """Return items with at least one active ``blocks`` dependency.
+
+    This is the bounded, project-wide counterpart to
+    ``_forward_active_blockers_via_sql`` for summary readiness. One read-only
+    SQL query obtains every candidate edge and blocker status. Its guaranteed
+    control row distinguishes a genuine zero-edge result from Dolt 2.2.3's
+    bare ``{}`` empty-result envelope. The canonical ``_is_active_blocker``
+    predicate keeps summary readiness aligned with directed claims. A
+    missing/unreadable blocker status remains active.
+    """
+    p = _dolt_sql_json(
+        "SELECT 'control' AS `row_kind`, '' AS `item_id`, '' AS `dependency_type`, "
+        "'' AS `status` UNION ALL "
+        "SELECT 'dependency' AS `row_kind`, `dep`.`issue_id` AS `item_id`, "
+        "`dep`.`type` AS `dependency_type`, `tgt`.`status` AS `status` "
+        f"FROM `{db}`.`dependencies` `dep` "
+        f"LEFT JOIN `{db}`.`issues` `tgt` "
+        "ON `tgt`.`id` = `dep`.`depends_on_issue_id` "
+        "WHERE `dep`.`type` = 'blocks' AND `dep`.`depends_on_issue_id` IS NOT NULL"
+    )
+    if p.returncode != 0:
+        raise _sql_failure(
+            f"could not read project dependencies over SQL: "
+            f"{_clean_bd_error(p.stderr or p.stdout)}",
+            p,
+        )
+    try:
+        payload = json.loads(p.stdout)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise BeadsError(f"could not parse project dependencies over SQL: {e}") from e
+    if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+        raise BeadsError("could not parse project dependencies over SQL: expected a rows list")
+    blocked_ids: set[str] = set()
+    control_rows = 0
+    for row in payload["rows"]:
+        if not isinstance(row, dict):
+            raise BeadsError(
+                "could not parse project dependencies over SQL: malformed dependency row"
+            )
+        if row.get("row_kind") == "control":
+            if (
+                row.get("item_id") != ""
+                or row.get("dependency_type") != ""
+                or row.get("status") != ""
+            ):
+                raise BeadsError(
+                    "could not parse project dependencies over SQL: malformed control row"
+                )
+            control_rows += 1
+            continue
+        if (
+            row.get("row_kind") != "dependency"
+            or not isinstance(row.get("item_id"), str)
+            or not row["item_id"]
+            or not isinstance(row.get("dependency_type"), str)
+            or not row["dependency_type"]
+            or "status" not in row
+            or (row["status"] is not None and not isinstance(row["status"], str))
+        ):
+            raise BeadsError(
+                "could not parse project dependencies over SQL: malformed dependency row"
+            )
+        if _is_active_blocker(row["dependency_type"], row["status"]):
+            blocked_ids.add(row["item_id"])
+    if control_rows != 1:
+        raise BeadsError(
+            "could not parse project dependencies over SQL: expected exactly one control row"
+        )
+    return blocked_ids
+
+
 def _forward_dependency_links_via_sql(db: str, item_id: str) -> list[dict]:
     """`item_id`'s forward (`direction: "from"`) dependency edges -- i.e.
     what THIS item depends on / is blocked by / supersedes / etc -- read via
@@ -2944,7 +3016,7 @@ def _history_events(history: list) -> list[ActivityEvent]:
     return events
 
 
-def project_activity(items: list[Item]) -> dict:
+def project_activity(items: list[Item], *, ready_items: list[Item] | None = None) -> dict:
     """Time-based aggregates for one project's items -- the shared
     computation behind the CLI's `instances` command and the `work_status`
     tool's per-project roll-up, so neither reinvents (or silently
@@ -2987,10 +3059,13 @@ def project_activity(items: list[Item]) -> dict:
             item has a readable `updated_at`.
     """
     now = datetime.now(UTC)
+    ready_for_age = (
+        ready_items
+        if ready_items is not None
+        else [i for i in items if i.status == "open" and LANE_WORK in i.tags]
+    )
     ready_ages = [
-        (now - i.created_at).total_seconds()
-        for i in items
-        if i.status == "open" and LANE_WORK in i.tags and i.created_at is not None
+        (now - i.created_at).total_seconds() for i in ready_for_age if i.created_at is not None
     ]
     # Throughput is counted only from resolutions that actually carry a
     # readable `closed_at`. A genuine 0 -- a project with no resolutions, or
@@ -6279,11 +6354,11 @@ class ProjectSummary:
     every field below is `None`/empty, not zero, so a caller can never
     mistake "not healthy" for "read as empty."
 
-    `ready` vs "unclaimed" vs `held`: in this system an OPEN work-lane item
-    IS an unclaimed, ready-to-claim work item -- there is no third state
-    between "open" and "held", so "ready" and "unclaimed" are the SAME set,
-    reported as the ONE number `ready` (not two subtly different ones). `held`
-    is the disjoint set of items currently claimed and in progress. This is
+    `ready` vs "unclaimed" vs `held`: an open work-lane item with no active
+    `blocks` dependency is ready to claim. Active blockers include every
+    blocker status except `closed`, matching directed claims; dependency-read
+    failure leaves readiness unknown. `held` is the disjoint set of items
+    currently claimed and in progress. This is
     the reconciliation of a dashboard that once showed "READY" and "unclaimed
     items" as two different totals for that one set -- see `ready_age_buckets`
     below and `_ready_age_buckets` for why they had drifted.
@@ -6464,11 +6539,13 @@ def _blocked_stale_count(blocked_items: list[Item]) -> int:
     return sum(1 for i in blocked_items if not _active_blockers(i))
 
 
-def _ready_age_buckets(items: list[Item]) -> dict[str, int]:
+def _ready_age_buckets(
+    items: list[Item], *, ready_items: list[Item] | None = None
+) -> dict[str, int]:
     """Age histogram of ready items whose values sum to EXACTLY `ready`.
 
     "Ready" here is the same set counted by `ProjectSummary.ready`: an open,
-    work-lane item -- i.e. an unclaimed work item. Every one of them lands in
+    work-lane item with no active `blocks` dependency. Every one lands in
     exactly one bucket, so `sum(_ready_age_buckets(items).values())` always
     equals that `ready` count. Two mechanisms guarantee it:
 
@@ -6482,7 +6559,11 @@ def _ready_age_buckets(items: list[Item]) -> dict[str, int]:
     "unclaimed items" set, computed two slightly different ways.
     """
     now = datetime.now(UTC)
-    ready = [i for i in items if i.status == "open" and LANE_WORK in i.tags]
+    ready = (
+        ready_items
+        if ready_items is not None
+        else [i for i in items if i.status == "open" and LANE_WORK in i.tags]
+    )
     out: dict[str, int] = {label: 0 for label, _, _ in READY_AGE_BUCKETS}
     out[UNKNOWN_READY_AGE] = 0
     for i in ready:
@@ -6521,11 +6602,12 @@ def project_summary(ws: Workspace, name: str) -> ProjectSummary:
          `None`/empty.
       4. Otherwise `STATUS_OK`, with real counts.
 
-    On the healthy path, fetches items exactly ONCE
-    (`ws.project(name).list(include_resolved=True)`) and derives every field
-    -- counts, `project_activity`'s aging/throughput figures, and the
-    ready-age histogram -- from that single in-memory list. No field here
-    costs a second `bd` call.
+    On the healthy path, reads the summary item projection once and derives
+    counts and throughput from that in-memory list. Readiness also requires
+    one read-only aggregate of dependency edges and blocker statuses so it
+    matches directed claimability. If that dependency read fails, readiness
+    and its age metrics are unknown while independent counts remain usable.
+    Neither read invokes `bd`.
 
     Exception: `held_stale`/`held_stale_oldest_age_seconds`. Real custody
     freshness lives in each item's `metadata` column, which
@@ -6565,9 +6647,21 @@ def project_summary(ws: Workspace, name: str) -> ProjectSummary:
         return ProjectSummary(name=name, status=truncate_status(f"{STATUS_UNAVAILABLE_PREFIX}{e}"))
     except BeadsError as e:
         return ProjectSummary(name=name, status=truncate_status(f"ERROR: {e}"))
+    try:
+        active_blocked_ids = _active_blocked_item_ids_via_sql(name)
+    except BeadsError:
+        # The item read succeeded, but dependency gating did not. Preserve all
+        # non-readiness metrics while exposing readiness as unknown.
+        ready_items = None
+    else:
+        ready_items = [
+            i
+            for i in items
+            if i.status == "open" and LANE_WORK in i.tags and i.id not in active_blocked_ids
+        ]
     held_items = [i for i in items if i.status == "held"]
     blocked_items = [i for i in items if i.status == "blocked"]
-    activity = project_activity(items)
+    activity = project_activity(items, ready_items=ready_items or [])
     held_stale: int | None
     held_stale_oldest_age_seconds: float | None
     if held_items:
@@ -6586,7 +6680,7 @@ def project_summary(ws: Workspace, name: str) -> ProjectSummary:
         name=name,
         status=STATUS_OK,
         total=len(items),
-        ready=sum(1 for i in items if i.status == "open" and LANE_WORK in i.tags),
+        ready=len(ready_items) if ready_items is not None else None,
         held=len(held_items),
         intake=sum(1 for i in items if i.status == "open" and LANE_INTAKE in i.tags),
         blocked=sum(1 for i in items if i.status == "blocked"),
@@ -6599,7 +6693,9 @@ def project_summary(ws: Workspace, name: str) -> ProjectSummary:
         resolved_24h=activity["resolved_24h"],
         resolved_7d=activity["resolved_7d"],
         resolved_daily=activity["resolved_daily"],
-        ready_age_buckets=_ready_age_buckets(items),
+        ready_age_buckets=(
+            _ready_age_buckets(items, ready_items=ready_items) if ready_items is not None else None
+        ),
         blocked_stale=_blocked_stale_count(blocked_items),
         held_stale_oldest_age_seconds=held_stale_oldest_age_seconds,
     )
